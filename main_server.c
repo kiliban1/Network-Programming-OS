@@ -30,14 +30,12 @@ typedef struct _USR {
 USR *head = NULL;
 USR *tail = NULL;
 
-pthread_mutex_t mutex;
+pthread_rwlock_t rooms_rw;
+pthread_rwlock_t users_rw;
 
 int rooms[NUM_OF_ROOMS];
 
 void display_connected(){
-
-	// traverse through all connected clients
-	USR* cur = head;
 
 	// figure out sender address
 	struct sockaddr_in cliaddr;
@@ -45,17 +43,34 @@ void display_connected(){
 
 	printf("\n----Connected Clients----\n");
 
+	pthread_rwlock_rdlock(&users_rw);
+
+	// traverse through all connected clients
+	USR* cur = head;
+
 	while (cur != NULL) {
 
 		if (getpeername(cur->clisockfd, (struct sockaddr*)&cliaddr, &clen) < 0) error("ERROR Unknown sender!");
 
-		printf("[%s]\n", inet_ntoa(cliaddr.sin_addr));
+		printf("[%s]", inet_ntoa(cliaddr.sin_addr));
+
+		if(cur->user_name[0] != '\0')
+			printf(" %s,", cur->user_name);
+
+		if(cur->room_num >= 0)
+			printf(" Room %d", cur->room_num + 1);
+
+		printf("\n");
 
 		cur = cur->next;
 	}
 
-	printf("\n-------Open Rooms-------\n");
-	pthread_mutex_lock(&mutex);
+	pthread_rwlock_unlock(&users_rw);
+
+	printf("\n-------Open Rooms--------\n");
+
+	pthread_rwlock_rdlock(&rooms_rw);
+
 	for(int i = 0; i < NUM_OF_ROOMS; i++){
 
 		if(rooms[i] > 0){
@@ -64,17 +79,27 @@ void display_connected(){
 			else
 				printf("Room %d: %d people\n", i + 1, rooms[i]);
 		}
+		else if(rooms[i] < 0){
+			printf("ERROR Room count is negative!\n");
+		}
 	}
-	pthread_mutex_unlock(&mutex);
-	printf("-------------------------\n");
+
+	pthread_rwlock_unlock(&rooms_rw);
+
+	printf("-------------------------\n\n");
 }
 
-void add_tail(int newclisockfd)
+USR* add_tail(int newclisockfd, char* user_name, int room_num)
 {
+	USR* thisUsr;
+
+	pthread_rwlock_wrlock(&users_rw);
+
 	if (head == NULL) {
 		head = (USR*) malloc(sizeof(USR));
 		head->clisockfd = newclisockfd;
-		head->room_num = -1;
+		head->room_num = room_num;
+		head->user_name = user_name;
 		head->next = head->prev = NULL; 
 		tail = head;
 
@@ -82,43 +107,61 @@ void add_tail(int newclisockfd)
 	} else {
 		tail->next = (USR*) malloc(sizeof(USR));
 		tail->next->clisockfd = newclisockfd;
-		tail->next->room_num = -1;
+		tail->next->room_num = room_num;
+		tail->next->user_name = user_name;
 		tail->next->next = NULL;
 		tail->next->prev = tail;
 		tail = tail->next;
 	}
+
+	thisUsr = tail;
+
+	pthread_rwlock_unlock(&users_rw);
+
+	return thisUsr;
 }
 
 void remove_user(USR* victim)
 {
-	if(victim->prev != NULL)
+	pthread_rwlock_wrlock(&users_rw);
+
+	if(victim->prev != NULL){
 		victim->prev->next = victim->next;
-
-	if(victim->next != NULL)
-		victim->next->prev = victim->prev;
-
-	if(victim == head)
+	}
+	else if(head == victim){
 		head = head->next;
-	
-	if(victim == tail)
-		tail = tail->prev;
-	
+	}
 
+	if(victim->next != NULL){
+		victim->next->prev = victim->prev;
+	}
+	else if(tail == victim){
+		tail = tail->prev;
+	}
+		
 	// figure out sender address
 	struct sockaddr_in cliaddr;
 	socklen_t clen = sizeof(cliaddr);
 
 	if (getpeername(victim->clisockfd, (struct sockaddr*)&cliaddr, &clen) < 0) error("ERROR Unknown sender!");
 		
-	printf("\n[%s] %s DISCONNECTED!\n", inet_ntoa(cliaddr.sin_addr), victim->user_name);
+	printf("\n[%s] ", inet_ntoa(cliaddr.sin_addr));
 	
-	if(victim->room_num > -1){
-		pthread_mutex_lock(&mutex);
-		rooms[victim->room_num]--;
-		pthread_mutex_unlock(&mutex);
-	}
-
+	if(victim->user_name[0] != '\0'){
+		printf("%s, ", victim->user_name);
+	}	
+	
+	printf("Room %d DISCONNECTED!\n", victim->room_num + 1);
+	int usr_room = victim->room_num;
 	free(victim);
+
+	pthread_rwlock_unlock(&users_rw);
+
+	if(usr_room > -1){
+		pthread_rwlock_wrlock(&rooms_rw);
+		rooms[usr_room]--;
+		pthread_rwlock_unlock(&rooms_rw);
+	}
 
 	display_connected();
 }
@@ -136,13 +179,17 @@ void broadcast(USR* sendingUsr, char* message)
 	socklen_t clen = sizeof(cliaddr);
 	if (getpeername(sendingUsr->clisockfd, (struct sockaddr*)&cliaddr, &clen) < 0) error("ERROR Unknown sender!");
 
+	pthread_rwlock_rdlock(&users_rw);
+
 	// traverse through all connected clients
 	USR* cur = head;
+
 	while (cur != NULL) {
 
-		// remove users with invalid file descriptors
 		if(fcntl(cur->clisockfd, F_GETFD) == -1){
+			pthread_rwlock_unlock(&users_rw);
 			remove_user(cur);
+			pthread_rwlock_rdlock(&users_rw);
 		}
 		// check if cur is not the one who sent the message
 		else if (cur->clisockfd != sendingUsr->clisockfd && cur->room_num == sendingUsr->room_num) {
@@ -166,6 +213,8 @@ void broadcast(USR* sendingUsr, char* message)
 
 		cur = cur->next;
 	}
+
+	pthread_rwlock_unlock(&users_rw);
 }
 
 int room_assignment(int clisockfd){
@@ -186,18 +235,15 @@ int room_assignment(int clisockfd){
 		new_room = room_options[0];
 		room_choice = room_options[1];
 
-		printf("\nRoom options recieved New: %d and Room#: %d\n", new_room, room_choice);
+		//printf("\nRoom options recieved New: %d and Room#: %d\n", new_room, room_choice);
 		if(new_room == 1 && room_choice == 0){
 
 			//printf("NEW keyword found for room assign\n");
-			pthread_mutex_lock(&mutex);
+			pthread_rwlock_wrlock(&rooms_rw);
 			for(int i = 0; i < NUM_OF_ROOMS; i++){
 
 				if(rooms[i] == 0){
-					
 					rooms[i]++;
-		
-					pthread_mutex_unlock(&mutex);
 
 					buffer[0] = i + 1;
 
@@ -207,7 +253,7 @@ int room_assignment(int clisockfd){
 					return i;
 				}
 			}
-			pthread_mutex_unlock(&mutex);
+			pthread_rwlock_unlock(&rooms_rw);
 			
 		}
 		else if(new_room != 1 && room_choice > 0){
@@ -215,10 +261,10 @@ int room_assignment(int clisockfd){
 			//printf("ROOM NUM found for room assign\n");
 			
 			if((room_choice - 1) < NUM_OF_ROOMS){
-				pthread_mutex_lock(&mutex);
-				rooms[room_choice - 1]++;
 
-				pthread_mutex_unlock(&mutex);
+				pthread_rwlock_wrlock(&rooms_rw);
+				rooms[room_choice - 1]++;
+				pthread_rwlock_unlock(&rooms_rw);
 					
 				buffer[0] = room_choice;
 
@@ -233,10 +279,9 @@ int room_assignment(int clisockfd){
 		//printf("Creating room list\n");
 		int j = 0;
 		
-		pthread_mutex_lock(&mutex);
+		pthread_rwlock_rdlock(&rooms_rw);
 		for(int i = 0; i < NUM_OF_ROOMS; i++){
 
-			
 			if(rooms[i] > 0){
 				buffer[j] = i + 1;
 				buffer[j + 1] = rooms[i];
@@ -244,14 +289,14 @@ int room_assignment(int clisockfd){
 			}
 			
 		}	
-		pthread_mutex_unlock(&mutex);
+		pthread_rwlock_unlock(&rooms_rw);
 	
 		if(j == 0 && room_choice == 0){
 			//printf("No rooms, NEW keyword implicit\n");
 
-			pthread_mutex_lock(&mutex);
+			pthread_rwlock_wrlock(&rooms_rw);
 			rooms[0]++;
-			pthread_mutex_unlock(&mutex);
+			pthread_rwlock_unlock(&rooms_rw);
 
 			buffer[0] = 1;
 
@@ -277,7 +322,6 @@ int room_assignment(int clisockfd){
 
 typedef struct _ThreadArgs {
 	int clisockfd;
-	USR* user;
 } ThreadArgs;
 
 void* thread_main(void* args)
@@ -287,7 +331,6 @@ void* thread_main(void* args)
 
 	// get socket descriptor from argument
 	int clisockfd = ((ThreadArgs*) args)->clisockfd;
-	USR* currUsr = ((ThreadArgs*) args)->user;
 	free(args);
 
 	//-------------------------------
@@ -296,18 +339,21 @@ void* thread_main(void* args)
 	char user_name[32];
 	int nsen, nrcv, len;
 
-	currUsr->room_num = room_assignment(clisockfd);
+	int room_num = room_assignment(clisockfd);
 
 	memset(user_name, 0, 32);
-	nrcv = recv(clisockfd, user_name, 32, 0);
 
+	nrcv = recv(clisockfd, user_name, 32, 0);
 	if (nrcv < 0) error("ERROR recv() failed");
 	
 	len = strlen(user_name);
 
 	if(user_name[len - 1] == '\n') user_name[len - 1] = '\0';
 
-	currUsr->user_name = strdup(user_name);
+	USR* thisUsr;
+	thisUsr = add_tail(clisockfd, user_name, room_num); // add this new client to the client list
+	
+	display_connected();
 
 	while (1) {
 
@@ -321,13 +367,13 @@ void* thread_main(void* args)
 		if(len < 2) break;
 		else if(buffer[len - 1] == '\n') buffer[len - 1] = '\0';
 
-		printf("Message recv from [%s] Room %d: {%s}\n", user_name, (currUsr->room_num + 1), buffer);
+		printf("Message recv from [%s] Room %d: {%s}\n", user_name, (room_num + 1), buffer);
 
 		// we send the message to everyone except the sender
-		broadcast(currUsr, buffer);
+		broadcast(thisUsr, buffer);
 	}
 
-	remove_user(currUsr);
+	remove_user(thisUsr);
 
 	close(clisockfd);
 	//-------------------------------
@@ -337,7 +383,8 @@ void* thread_main(void* args)
 
 int main(int argc, char *argv[])
 {
-	pthread_mutex_init(&mutex, NULL);
+	pthread_rwlock_init(&rooms_rw, NULL);
+	pthread_rwlock_init(&users_rw, NULL);
 
 	memset(rooms, 0, NUM_OF_ROOMS);
 
@@ -364,22 +411,20 @@ int main(int argc, char *argv[])
 			(struct sockaddr *) &cli_addr, &clen);
 		if (newsockfd < 0) error("ERROR on accept");
 
-		//printf("Connected: %s\n", inet_ntoa(cli_addr.sin_addr));
-		add_tail(newsockfd); // add this new client to the client list
-		display_connected();
+		printf("Connected: %s\n", inet_ntoa(cli_addr.sin_addr));
 
 		// prepare ThreadArgs structure to pass client socket
 		ThreadArgs* args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
 		if (args == NULL) error("ERROR creating thread argument");
 		
 		args->clisockfd = newsockfd;
-		args->user = tail;
 
 		pthread_t tid;
 		if (pthread_create(&tid, NULL, thread_main, (void*) args) != 0) error("ERROR creating a new thread");
 	}
 
-	pthread_mutex_destroy(&mutex);
+	pthread_rwlock_destroy(&rooms_rw);
+	pthread_rwlock_destroy(&users_rw);
 
 	return 0; 
 }
